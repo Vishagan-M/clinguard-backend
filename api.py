@@ -12,6 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, UnidentifiedImageError
 from torchvision import models, transforms
 
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent
 CHECKPOINT = BASE_DIR / "clinguard_resnet18_best.pth"
 
@@ -19,7 +24,9 @@ CLASSES = ["glioma", "meningioma", "notumor", "pituitary"]
 MAX_FILE_SIZE = 10 * 1024 * 1024
 IMAGE_SIZE = 224
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 preprocess = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -30,45 +37,71 @@ preprocess = transforms.Compose([
     ),
 ])
 
+
+# --------------------------------------------------
+# FastAPI application
+# --------------------------------------------------
+
 app = FastAPI(
     title="ClinGuard MRI API",
-    description="Research prototype for brain MRI classification and Grad-CAM.",
-    version="1.1.0",
+    description=(
+        "Research prototype for brain MRI classification "
+        "and Grad-CAM visualization."
+    ),
+    version="1.2.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-    "https://brain-mri-sigma.vercel.app",
-],
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "https://brain-mri-sigma.vercel.app",
+    ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
+
+# --------------------------------------------------
+# Load trained ResNet18
+# --------------------------------------------------
+
 model = models.resnet18(weights=None)
-model.fc = torch.nn.Linear(model.fc.in_features, len(CLASSES))
+model.fc = torch.nn.Linear(
+    model.fc.in_features,
+    len(CLASSES),
+)
 
 if not CHECKPOINT.exists():
-    raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT}")
+    raise FileNotFoundError(
+        f"Checkpoint not found: {CHECKPOINT}"
+    )
 
 checkpoint = torch.load(
     CHECKPOINT,
     map_location=device,
     weights_only=True,
 )
+
 model.load_state_dict(checkpoint["model_state_dict"])
 model.to(device)
 model.eval()
 
-# ResNet18's final convolutional block provides the Grad-CAM activations.
+# Final convolutional block used for Grad-CAM.
 target_layer = model.layer4[-1]
+
+# Prevent simultaneous requests from interfering with
+# the shared model or Grad-CAM hooks.
 inference_lock = threading.Lock()
 
+
+# --------------------------------------------------
+# Health endpoint
+# --------------------------------------------------
 
 @app.get("/")
 def home():
@@ -82,61 +115,111 @@ def home():
     }
 
 
+# --------------------------------------------------
+# Grad-CAM visualization
+# --------------------------------------------------
+
 def create_gradcam(input_tensor, original_image, class_index):
     captured = {}
 
     def save_activation(_module, _inputs, output):
         captured["activation"] = output
-        output.retain_grad()
 
-    handle = target_layer.register_forward_hook(save_activation)
+    handle = target_layer.register_forward_hook(
+        save_activation
+    )
 
     try:
-        # Grad-CAM requires gradients; do not use inference_mode here.
-        model.zero_grad(set_to_none=True)
-
+        # Grad-CAM needs gradients, so this must not run
+        # inside torch.no_grad() or inference_mode().
         with torch.enable_grad():
             logits = model(input_tensor)
+            activation = captured["activation"]
+
+            # Explain the selected class's raw score.
             score = logits[0, class_index]
-            score.backward()
 
-        activation = captured["activation"].detach()
-        gradient = captured["activation"].grad.detach()
+            gradient = torch.autograd.grad(
+                outputs=score,
+                inputs=activation,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
 
-        # Average gradients spatially to get one weight per channel.
-        weights = gradient.mean(dim=(2, 3), keepdim=True)
-        cam = (weights * activation).sum(dim=1, keepdim=True).relu()
+        activation = activation.detach()
+        gradient = gradient.detach()
 
+        # Calculate channel importance weights.
+        weights = gradient.mean(
+            dim=(2, 3),
+            keepdim=True,
+        )
+
+        # Weighted combination of feature maps.
+        cam = (
+            weights * activation
+        ).sum(dim=1)[0].relu()
+
+        # Upsample to the input image size.
         cam = F.interpolate(
-            cam,
+            cam[None, None],
             size=(IMAGE_SIZE, IMAGE_SIZE),
             mode="bilinear",
             align_corners=False,
         )[0, 0]
 
+        # Normalize for display.
         cam = cam - cam.min()
         cam = cam / cam.max().clamp_min(1e-8)
+        cam = cam.cpu().numpy()
 
-        heat = (cam * 255).byte().cpu().numpy()
-        heat_image = Image.fromarray(heat, mode="L").convert("RGB")
+        # Suppress weaker activations for a cleaner display.
+        # This is a visualization choice, not a validated
+        # medical threshold.
+        threshold = 0.30
 
-        # Simple red heatmap blended over the resized source MRI.
-        heat_array = np.asarray(heat_image, dtype=np.float32)
-        red_overlay = np.zeros_like(heat_array)
-        red_overlay[:, :, 0] = heat_array[:, :, 0]
-        red_overlay[:, :, 1] = heat_array[:, :, 0] * 0.12
-        red_overlay[:, :, 2] = heat_array[:, :, 0] * 0.08
-        red_image = Image.fromarray(
-            np.clip(red_overlay, 0, 255).astype(np.uint8)
+        opacity = np.clip(
+            (cam - threshold) / (1.0 - threshold),
+            0.0,
+            1.0,
+        ) * 0.35
+
+        # Resize the original MRI for the overlay.
+        source = np.asarray(
+            original_image.resize(
+                (IMAGE_SIZE, IMAGE_SIZE)
+            ),
+            dtype=np.float32,
         )
 
-        source = original_image.resize((IMAGE_SIZE, IMAGE_SIZE))
-        overlay = Image.blend(source, red_image, alpha=0.38)
+        # Red heatmap overlay.
+        red = np.zeros_like(source)
+        red[:, :, 0] = 255
 
+        alpha = opacity[:, :, None]
+
+        overlay = (
+            source * (1.0 - alpha)
+            + red * alpha
+        )
+
+        overlay = np.clip(
+            overlay, 0, 255
+        ).astype(np.uint8)
+
+        # Encode as a JPEG data URL for the frontend.
         buffer = BytesIO()
-        overlay.save(buffer, format="JPEG", quality=85)
 
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        Image.fromarray(overlay).save(
+            buffer,
+            format="JPEG",
+            quality=90,
+        )
+
+        encoded = base64.b64encode(
+            buffer.getvalue()
+        ).decode("ascii")
+
         return "data:image/jpeg;base64," + encoded
 
     finally:
@@ -144,16 +227,25 @@ def create_gradcam(input_tensor, original_image, class_index):
         model.zero_grad(set_to_none=True)
 
 
+# --------------------------------------------------
+# MRI prediction endpoint
+# --------------------------------------------------
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+
+    # Validate declared upload type.
     if file.content_type not in {
-        "image/jpeg", "image/png", "image/webp"
+        "image/jpeg",
+        "image/png",
+        "image/webp",
     }:
         raise HTTPException(
             status_code=415,
             detail="Upload a JPEG, PNG, or WebP image.",
         )
 
+    # Read at most 10 MB plus one byte.
     contents = await file.read(MAX_FILE_SIZE + 1)
 
     if len(contents) > MAX_FILE_SIZE:
@@ -163,27 +255,42 @@ async def predict(file: UploadFile = File(...)):
         )
 
     if not contents:
-        raise HTTPException(status_code=400, detail="Empty upload.")
+        raise HTTPException(
+            status_code=400,
+            detail="Empty upload.",
+        )
 
+    # Decode and preprocess the image.
     try:
         with Image.open(BytesIO(contents)) as image:
             original_image = image.convert("RGB")
-            tensor = preprocess(original_image).unsqueeze(0).to(device)
+
+            tensor = preprocess(
+                original_image
+            ).unsqueeze(0).to(device)
+
     except (UnidentifiedImageError, OSError):
         raise HTTPException(
             status_code=400,
             detail="The uploaded file is not a valid image.",
         )
 
+    # Classification and Grad-CAM use the same model.
     try:
-        # Protect the shared model and its temporary gradient hooks.
         with inference_lock:
+
+            # Standard classification inference.
             with torch.no_grad():
                 logits = model(tensor)
-                probabilities = torch.softmax(logits, dim=1)[0].cpu()
+                probabilities = torch.softmax(
+                    logits, dim=1
+                )[0].cpu()
 
-            predicted_index = int(probabilities.argmax())
+            predicted_index = int(
+                probabilities.argmax()
+            )
 
+            # Explain the predicted class.
             gradcam = create_gradcam(
                 tensor,
                 original_image,
@@ -191,25 +298,34 @@ async def predict(file: UploadFile = File(...)):
             )
 
     except Exception:
-        # Keep internal tracebacks out of the public API response.
+        # Keep internal tracebacks out of API responses.
+        # Inspect server logs if inference fails.
         raise HTTPException(
             status_code=500,
-            detail="Image analysis failed. Check the backend runtime logs.",
+            detail=(
+                "Image analysis failed. "
+                "Check the backend runtime logs."
+            ),
         )
 
     return {
         "prediction": CLASSES[predicted_index],
-        "confidence": round(float(probabilities[predicted_index]), 4),
+        "confidence": round(
+            float(probabilities[predicted_index]), 4
+        ),
         "probabilities": {
-            name: round(float(probabilities[i]), 4)
+            name: round(
+                float(probabilities[i]), 4
+            )
             for i, name in enumerate(CLASSES)
         },
         "model": "ResNet18",
         "gradcam": gradcam,
         "explanation_notice": (
-            "Grad-CAM is a coarse visualization of regions influencing "
-            "the model score. It is not a tumor segmentation or proof "
-            "of clinically meaningful reasoning."
+            "Grad-CAM is an experimental, coarse visualization "
+            "of regions influencing the model score. It is not "
+            "tumor segmentation or proof of clinically meaningful "
+            "reasoning. Red regions do not establish tumor location."
         ),
         "notice": (
             "Research output only. Not a medical diagnosis. "
